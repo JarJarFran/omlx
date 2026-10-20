@@ -2688,8 +2688,8 @@ class Scheduler:
         self.total_completion_tokens = 0
         # Set by the engine when MoE expert offload wrapped the model.
         self.moe_offload_stats: Callable[[], dict] | None = None
-        self.moe_offload_release: Callable[[], int] | None = None
-        self.moe_offload_restore: Callable[[], None] | None = None
+        self.moe_offload_release: Callable[..., int] | None = None
+        self.moe_offload_restore: Callable[..., None] | None = None
         self._moe_offload_slots_released = False
 
         # Step counter for periodic cleanup
@@ -6182,15 +6182,21 @@ class Scheduler:
                 total / 1024**2,
             )
 
-    def release_moe_offload_slots(self, request_id: str) -> int:
+    def release_moe_offload_slots(
+        self, request_id: str, need_bytes: int | None = None
+    ) -> int:
         """Release the offload slots for ``request_id``'s prefill; return the bytes.
 
-        Skipped while another request runs; the next decode step restores them."""
+        ``need_bytes`` is the prefill's shortfall: the release covers it in
+        coarse steps instead of shrinking every cache to its floor. Skipped
+        while another request runs; the next decode step restores them."""
         if self.moe_offload_release is None or any(
             rid != request_id for rid in self.running
         ):
             return 0
-        released = self.moe_offload_release()
+        released = self.moe_offload_release(
+            need_bytes, lambda: Scheduler._clear_cache(self)
+        )
         if released:
             self._moe_offload_slots_released = True
             self._reclaim_prefill_headroom()
@@ -15244,7 +15250,7 @@ class Scheduler:
             ) and self.running:
                 if self._moe_offload_slots_released:
                     self._moe_offload_slots_released = False
-                    self.moe_offload_restore()
+                    self.moe_offload_restore(lambda: Scheduler._clear_cache(self))
                 _t_decode_start = time.perf_counter()
                 if self.batch_generator is not None:
                     responses = list(self.batch_generator.next_generated())
