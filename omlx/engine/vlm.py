@@ -1766,6 +1766,11 @@ class VLMBatchedEngine(BaseEngine):
         return getattr(self, "_diffusion_family", None) == "block"
 
     @property
+    def supports_reply_prefix(self) -> bool:
+        """Chat requests take a ``reply_prefix`` (see ``BatchedEngine``)."""
+        return not self.is_diffusion_model
+
+    @property
     def supports_tool_calling(self) -> bool:
         """True when a tool parser was injected into the tokenizer.
 
@@ -3893,6 +3898,7 @@ class VLMBatchedEngine(BaseEngine):
         is_partial: bool | None = None,
         videos: list[str] | None = None,
         video_hashes: list[str] | None = None,
+        reply_prefix: str | None = None,
     ) -> Tuple[
         List[int],
         Optional[mx.array],
@@ -3918,6 +3924,8 @@ class VLMBatchedEngine(BaseEngine):
                 ``True``/``False`` — the server has already decided.  ``None``
                 (default) — auto-detect from ``messages`` for direct engine
                 callers.
+            reply_prefix: Raw text appended after the generation prompt, which
+                the reply continues.
 
         Returns:
             Tuple of (
@@ -4103,6 +4111,11 @@ class VLMBatchedEngine(BaseEngine):
                 add_generation_prompt=True,
                 **template_kwargs,
             )
+        if reply_prefix:
+            if isinstance(prompt, str):
+                prompt += reply_prefix
+            else:
+                prompt = [item + reply_prefix for item in prompt]
 
         # Images with cached features and grids skip the image processor.
         fast_cached_features = None
@@ -4524,6 +4537,7 @@ class VLMBatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
+        reply_prefix: str | None = None,
     ) -> str:
         """Apply chat template for text-only messages (no images).
 
@@ -4535,7 +4549,17 @@ class VLMBatchedEngine(BaseEngine):
                 for direct engine callers.
             add_generation_prompt: Overrides the partial-derived default, used
                 to render the same messages without the generation prompt.
+            reply_prefix: Raw text appended after the generation prompt, which
+                the reply continues.
         """
+        if reply_prefix:
+            prompt = self._apply_chat_template(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+            )
+            return prompt + reply_prefix
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
                 is_partial = detect_and_strip_partial(messages)
@@ -5109,6 +5133,7 @@ class VLMBatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
+            reply_prefix=kwargs.get("reply_prefix"),
         )
         # Tokenizer errors propagate as 500 today regardless of where they
         # fire; the real chat path's add_request → tokenize call has no
@@ -5388,6 +5413,7 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        reply_prefix = kwargs.pop("reply_prefix", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -5433,6 +5459,7 @@ class VLMBatchedEngine(BaseEngine):
                 chat_template_kwargs=ct_kwargs,
                 tools=template_tools,
                 is_partial=partial,
+                reply_prefix=reply_prefix,
                 **video_kwargs,
             )
         finally:
@@ -5868,6 +5895,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        reply_prefix: str | None = None,
     ) -> int:
         """Count prompt tokens for chat messages (text-only approximation).
 
@@ -5885,6 +5913,7 @@ class VLMBatchedEngine(BaseEngine):
             template_tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
+            reply_prefix=reply_prefix,
         )
         return len(self._tokenizer.encode(prompt))
 

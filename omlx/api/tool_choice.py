@@ -5,8 +5,12 @@
 ``any`` and ``tool``, and the Responses API's choices, are mapped to these
 first). The reply is started with the opening of a call in the model's own
 format, as its chat template renders an assistant turn with calls, and the
-model writes the rest. No grammar is needed, so this works without xgrammar
-and on every engine that renders oMLX's partial assistant turns.
+model writes the rest. No grammar is needed, so this works without xgrammar.
+
+The opening is a partial assistant turn, which every in-process engine
+renders. Gemma 4's template drops the thought channel from assistant turns,
+so its opening is appended to the rendered generation prompt instead, which
+needs an engine that takes a ``reply_prefix``.
 """
 
 from __future__ import annotations
@@ -26,16 +30,25 @@ logger = logging.getLogger(__name__)
 # Required: cut before the name, so the name's own tokens stay the model's
 # (Qwen tokenizes "<function=get_weather" as "<function", "=get", "_weather").
 # No opening ends in whitespace: templates trim the content of the partial
-# assistant turn that carries it. Gemma 4 is left out: its partial turn lacks
-# the empty thought channel of its generation prompt, and with several tools,
-# or with thinking on, the model does not continue the call reliably.
+# assistant turn that carries it.
 _OPENINGS = {
     "qwen3_coder": ("<tool_call>\n<function={name}>", "<tool_call>\n<function"),
     "json_tools": (
         '<tool_call>\n{{"name": "{name}", "arguments":',
         '<tool_call>\n{"name": "',
     ),
+    "gemma4": ("<|tool_call>call:{name}{{", "<|tool_call>call:"),
 }
+
+# Formats whose model writes its own thought channel, with its raw open and
+# close markers. Their template drops that channel from a partial assistant
+# turn: Gemma 4's generation prompt ends with an empty one when thinking is
+# off, and its model opens one first when thinking is on. So the opening, and
+# the reasoning before it, follow the generation prompt as raw text.
+_THOUGHT_CHANNELS = {"gemma4": ("<|channel>thought\n", "<channel|>")}
+
+# How oMLX's output parsers write a reasoning block in the reply text.
+_THINK_OPEN, _THINK_CLOSE = "<think>\n", "</think>"
 
 
 @dataclass(frozen=True)
@@ -48,14 +61,30 @@ class ForcedToolCall:
     called once, so the reply ends with its call; ``"required"`` lets the
     model make more calls after the first.
 
-    ``thinks``: the prompt opens the reasoning block, so the model reasons
-    before the call.
+    ``thinks``: the model reasons before the call, in the reasoning block
+    the prompt opens.
+
+    ``thought``: the raw open and close markers of the thought channel, for
+    formats whose reply starts after the generation prompt as raw text (the
+    engine's ``reply_prefix``) instead of in a partial assistant turn.
     """
 
     opening: str
     close: str
     single: bool
     thinks: bool = False
+    thought: tuple[str, str] | None = None
+
+    @property
+    def reply_prefix(self) -> str | None:
+        """Raw text the reply starts with after the generation prompt.
+
+        The opening, or, when the model reasons first, the open marker of its
+        thought channel. None for formats that use a partial turn.
+        """
+        if self.thought is None:
+            return None
+        return self.thought[0] if self.thinks else self.opening
 
 
 def _tool_names(tools: list[dict] | None) -> list[str]:
@@ -113,12 +142,17 @@ def _parser_format(tokenizer: Any) -> str | None:
 
 
 def resolve_forced_tool_call(
-    tool_choice: Any, tools: list[dict] | None, tokenizer: Any
+    tool_choice: Any,
+    tools: list[dict] | None,
+    tokenizer: Any,
+    *,
+    reply_prefix: bool = False,
 ) -> ForcedToolCall | None:
     """Return the call a ``"required"`` or named ``tool_choice`` forces.
 
     None for ``"auto"``, ``"none"`` and anything else, which keep today's
-    behaviour, and for tool-call formats this module does not know (logged).
+    behaviour, and for tool-call formats this module does not know (logged),
+    or whose reply needs a ``reply_prefix`` the engine does not take.
     Raises InvalidRequestError when the choice cannot be met by ``tools``.
     """
     if tool_choice == "required":
@@ -143,11 +177,17 @@ def resolve_forced_tool_call(
             f"tool_choice: function {name!r} is not in tools", field="tool_choice"
         )
     kind = _parser_format(tokenizer)
-    if kind is None:
+    thought = _THOUGHT_CHANNELS.get(kind)
+    if kind is None or (thought is not None and not reply_prefix):
+        reason = (
+            "this model's tool-call format has no known call opening"
+            if kind is None
+            else "this engine cannot append the call's opening to the prompt"
+        )
         logger.warning(
-            "tool_choice %r is not enforced: this model's tool-call format has "
-            'no known call opening; the model chooses as with "auto"',
+            'tool_choice %r is not enforced: %s; the model chooses as with "auto"',
             tool_choice if name is None else name,
+            reason,
         )
         return None
     single = name is not None
@@ -156,7 +196,7 @@ def resolve_forced_tool_call(
     named, required = _OPENINGS[kind]
     opening = named.format(name=name) if name is not None else required
     close = getattr(tokenizer, "tool_call_end", None) or "</tool_call>"
-    return ForcedToolCall(opening=opening, close=close, single=single)
+    return ForcedToolCall(opening=opening, close=close, single=single, thought=thought)
 
 
 def forced_call_messages(
@@ -189,11 +229,12 @@ async def forced_tool_call_outputs(
 ) -> AsyncIterator[Any]:
     """Stream a reply that is the forced call, as ``engine.stream_chat`` does.
 
-    When the prompt opens the reasoning block (``forced.thinks``), the model
-    reasons first: generation stops at the end of its reasoning, and a second
-    request continues the same prompt with the reasoning, its close and the
-    call's opening (the prefix cache holds the shared prompt). Otherwise
-    ``messages`` already end with the partial turn holding the opening.
+    When the model reasons first (``forced.thinks``), generation stops at the
+    end of its reasoning, and a second request continues the same prompt with
+    the reasoning, its close and the call's opening (the prefix cache holds
+    the shared prompt). Otherwise ``messages`` already end with the partial
+    turn holding the opening, or the engine appends it to the generation
+    prompt (``forced.reply_prefix``).
 
     The texts are those the model would have written, so the thinking and
     tool-call parsers downstream see the whole call. Usage counts the
@@ -206,14 +247,32 @@ async def forced_tool_call_outputs(
     if forced.single:
         # A named function is called once: the reply ends after its call.
         stop.append(forced.close)
+    if forced.thought is not None:
+        kwargs = {**kwargs, "reply_prefix": forced.reply_prefix}
     head = forced.opening  # text before the engine's own output
     base = None  # phase 1's last output when the model reasoned first
     if forced.thinks:
-        think_end = getattr(tokenizer, "think_end", None) or "</think>"
+        lead = ""  # text phase 1's output starts with
+        if forced.thought is not None:
+            # The prompt opens the model's thought channel. The scheduler
+            # writes the open tag when it detects that; otherwise it is added
+            # here, so the reply reads as an unforced one.
+            think_end = forced.thought[1]
+            lead = _THINK_OPEN
+        else:
+            think_end = getattr(tokenizer, "think_end", None) or "</think>"
         phase1 = {**kwargs, "stop": [think_end], "stop_skips_reasoning": False}
         last = None
+        pending = lead
         async with aclosing(engine.stream_chat(messages=messages, **phase1)) as outputs:
             async for output in outputs:
+                if lead and not output.text.startswith(lead):
+                    output = replace(
+                        output,
+                        text=lead + output.text,
+                        new_text=pending + (output.new_text or ""),
+                    )
+                pending = ""
                 if last is not None:
                     yield replace(last, finished=False, finish_reason=None)
                 last = output
@@ -223,15 +282,28 @@ async def forced_tool_call_outputs(
             yield last  # out of tokens (or failed) while reasoning: no call
             return
         yield replace(last, finished=False, finish_reason=None)
-        reasoning = last.text
-        head = f"{think_end}\n\n{forced.opening}"
+        reasoning = last.text[len(lead) :]
+        if forced.thought is None:
+            head = f"{think_end}\n\n{forced.opening}"
+            added = head
+            messages = forced_call_messages(messages, forced, reasoning.strip())
+            kwargs = {**kwargs, "is_partial": True}
+        else:
+            body = reasoning.rstrip()
+            if body.endswith(_THINK_CLOSE):
+                # The output parser closed the block when generation stopped.
+                reasoning = body[: -len(_THINK_CLOSE)]
+            else:
+                head = f"{_THINK_CLOSE}\n{forced.opening}"
+            added = think_end + forced.opening
+            kwargs = {
+                **kwargs,
+                "reply_prefix": forced.thought[0] + reasoning + added,
+            }
         base = replace(
             last,
-            text=reasoning,
-            completion_tokens=last.completion_tokens + _token_count(tokenizer, head),
+            completion_tokens=last.completion_tokens + _token_count(tokenizer, added),
         )
-        messages = forced_call_messages(messages, forced, reasoning.strip())
-        kwargs = {**kwargs, "is_partial": True}
         kwargs.pop("_prepared_prompt", None)
         kwargs.pop("thinking_budget", None)
         kwargs["max_tokens"] = max(

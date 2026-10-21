@@ -48,6 +48,10 @@ def _tokenizer(parser=qwen3_coder, start="<tool_call>", end="</tool_call>"):
     )
 
 
+def _gemma4_tokenizer():
+    return _tokenizer(gemma4, "<|tool_call>", "<tool_call|>")
+
+
 class TestResolveForcedToolCall:
     @pytest.mark.parametrize("choice", [None, "auto", "none", "any", {"type": "x"}])
     def test_other_choices_keep_todays_behaviour(self, choice):
@@ -81,13 +85,33 @@ class TestResolveForcedToolCall:
             '<tool_call>\n{"name": "'
         )
 
-    def test_gemma4_keeps_todays_behaviour(self, caplog):
-        # Measured on Gemma 4 26B-A4B: with several tools or thinking on, the
-        # model does not continue a prefilled call reliably.
-        tokenizer = _tokenizer(gemma4, "<|tool_call>", "<tool_call|>")
+    def test_gemma4_needs_an_engine_that_takes_a_reply_prefix(self, caplog):
+        # Its template drops the thought channel from a partial assistant turn.
         with caplog.at_level("WARNING"):
-            assert resolve_forced_tool_call(NAMED, TOOLS, tokenizer) is None
+            assert resolve_forced_tool_call(NAMED, TOOLS, _gemma4_tokenizer()) is None
         assert "not enforced" in caplog.text
+
+    def test_gemma4_opening_follows_the_generation_prompt(self):
+        tokenizer = _gemma4_tokenizer()
+        forced = resolve_forced_tool_call(NAMED, TOOLS, tokenizer, reply_prefix=True)
+        assert forced == ForcedToolCall(
+            opening="<|tool_call>call:get_time{",
+            close="<tool_call|>",
+            single=True,
+            thought=("<|channel>thought\n", "<channel|>"),
+        )
+        assert forced.reply_prefix == forced.opening
+        # Reasoning first: the reply opens the model's thought channel.
+        assert replace(forced, thinks=True).reply_prefix == "<|channel>thought\n"
+        required = resolve_forced_tool_call(
+            "required", TOOLS, tokenizer, reply_prefix=True
+        )
+        assert required.opening == "<|tool_call>call:"
+
+    def test_partial_turn_formats_have_no_reply_prefix(self):
+        forced = resolve_forced_tool_call(NAMED, TOOLS, _tokenizer(), reply_prefix=True)
+        assert forced.thought is None
+        assert forced.reply_prefix is None
 
     @pytest.mark.parametrize("choice", ["required", NAMED])
     def test_openings_never_end_in_whitespace(self, choice):
@@ -329,3 +353,76 @@ class TestForcedToolCallOutputs:
         assert outputs[-1].finish_reason == "length"
         assert outputs[-1].text == "Hmm hmm"
         assert "".join(o.new_text for o in outputs) == "Hmm hmm"
+
+
+GEMMA4_CALL = 'city:<|"|>Vienna<|"|>}'
+
+
+def _gemma4_forced(thinks=False):
+    forced = resolve_forced_tool_call(
+        NAMED, TOOLS, _gemma4_tokenizer(), reply_prefix=True
+    )
+    return replace(forced, thinks=thinks)
+
+
+class TestThoughtChannelOutputs:
+    """Gemma 4: the reply starts after the generation prompt, as raw text."""
+
+    @pytest.mark.asyncio
+    async def test_opening_is_the_reply_prefix(self):
+        engine = FakeEngine(_stream([GEMMA4_CALL]))
+
+        outputs = await _collect(engine, USER, _gemma4_forced(), max_tokens=64)
+
+        [call] = engine.calls
+        assert call["messages"] == USER
+        assert call["reply_prefix"] == "<|tool_call>call:get_time{"
+        assert "is_partial" not in call
+        assert call["stop"] == ["<tool_call|>"]
+        text = "<|tool_call>call:get_time{" + GEMMA4_CALL + "<tool_call|>"
+        assert outputs[-1].text == text
+        assert "".join(o.new_text for o in outputs) == text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheduler_opens", [False, True])
+    @pytest.mark.parametrize("parser_closes", [False, True])
+    async def test_reasoning_in_the_thought_channel_comes_first(
+        self, parser_closes, scheduler_opens
+    ):
+        # The scheduler writes the open tag when it detects the prompt's open
+        # channel, and the output parser may close the block itself when
+        # generation stops at the channel's close marker.
+        reasoning = ["The user", " asks the time.\n"]
+        if scheduler_opens:
+            reasoning[0] = "<think>\n" + reasoning[0]
+        if parser_closes:
+            reasoning.append("</think>\n")
+        engine = FakeEngine(_stream(reasoning), _stream([GEMMA4_CALL]))
+
+        outputs = await _collect(
+            engine,
+            USER,
+            _gemma4_forced(thinks=True),
+            max_tokens=100,
+            _prepared_prompt=("prompt", [1, 2]),
+        )
+
+        phase1, phase2 = engine.calls
+        assert phase1["messages"] == phase2["messages"] == USER
+        assert phase1["reply_prefix"] == "<|channel>thought\n"
+        assert phase1["stop"] == ["<channel|>"]
+        assert phase1["_prepared_prompt"] == ("prompt", [1, 2])
+        # Phase 2 continues phase 1's prompt with the raw reasoning.
+        assert phase2["reply_prefix"] == (
+            "<|channel>thought\nThe user asks the time.\n<channel|>"
+            "<|tool_call>call:get_time{"
+        )
+        assert "_prepared_prompt" not in phase2
+        assert "is_partial" not in phase2
+        # The reply reads as oMLX's Gemma 4 parser writes reasoning.
+        text = (
+            "<think>\nThe user asks the time.\n</think>\n"
+            "<|tool_call>call:get_time{" + GEMMA4_CALL + "<tool_call|>"
+        )
+        assert outputs[-1].text == text
+        assert "".join(o.new_text for o in outputs) == text

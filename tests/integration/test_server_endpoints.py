@@ -1695,6 +1695,84 @@ class TestForcedToolChoice:
         assert kwargs["messages"][-1]["role"] == "user"
         assert engine.calls == []
 
+    # Gemma 4: the call's opening follows the generation prompt as raw text.
+
+    GEMMA4_CALL = 'city:<|"|>Vienna<|"|>}'
+
+    @pytest.fixture
+    def gemma4_engine(self, engine):
+        from mlx_lm.tool_parsers.gemma4 import parse_tool_call
+
+        engine.tokenizer.tool_call_start = "<|tool_call>"
+        engine.tokenizer.tool_call_end = "<tool_call|>"
+        engine.tokenizer.tool_parser = parse_tool_call
+        engine.supports_reply_prefix = True
+        return engine
+
+    def test_gemma4_named_call_follows_the_generation_prompt(
+        self, client, gemma4_engine, monkeypatch
+    ):
+        # Thinking off: the generation prompt holds an empty thought channel.
+        suffix = "<|turn>model\n<|channel>thought\n<channel|>"
+        monkeypatch.setattr(
+            gemma4_engine, "_generation_prompt_text", lambda *a: (suffix, False)
+        )
+        gemma4_engine.scripts.append([self.GEMMA4_CALL])
+        named = {"type": "function", "function": {"name": "get_time"}}
+
+        response = client.post("/v1/chat/completions", json=self._payload(named))
+
+        assert response.status_code == 200
+        [call] = response.json()["choices"][0]["message"]["tool_calls"]
+        assert call["function"]["name"] == "get_time"
+        assert json.loads(call["function"]["arguments"]) == {"city": "Vienna"}
+        [sent] = gemma4_engine.calls
+        assert sent["messages"][-1]["role"] == "user"
+        assert sent["is_partial"] is False
+        assert sent["reply_prefix"] == "<|tool_call>call:get_time{"
+
+    def test_gemma4_reasons_in_its_thought_channel_first(
+        self, client, gemma4_engine, monkeypatch
+    ):
+        # Thinking on: the model opens its own thought channel.
+        monkeypatch.setattr(
+            gemma4_engine,
+            "_generation_prompt_text",
+            lambda *a: ("<|turn>model\n", False),
+        )
+        gemma4_engine.scripts += [["Vienna is in Austria.\n"], [self.GEMMA4_CALL]]
+        named = {"type": "function", "function": {"name": "get_time"}}
+
+        response = client.post("/v1/chat/completions", json=self._payload(named))
+
+        assert response.status_code == 200
+        message = response.json()["choices"][0]["message"]
+        assert message["reasoning_content"].strip() == "Vienna is in Austria."
+        [call] = message["tool_calls"]
+        assert call["function"]["name"] == "get_time"
+        phase1, phase2 = gemma4_engine.calls
+        assert phase1["reply_prefix"] == "<|channel>thought\n"
+        assert phase1["stop"] == ["<channel|>"]
+        assert phase2["reply_prefix"] == (
+            "<|channel>thought\nVienna is in Austria.\n<channel|>"
+            "<|tool_call>call:get_time{"
+        )
+        assert phase2["messages"][-1]["role"] == "user"
+
+    def test_gemma4_is_not_enforced_without_reply_prefix(self, client, engine):
+        from mlx_lm.tool_parsers.gemma4 import parse_tool_call
+
+        engine.tokenizer.tool_parser = parse_tool_call
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+        named = {"type": "function", "function": {"name": "get_time"}}
+
+        response = client.post("/v1/chat/completions", json=self._payload(named))
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert "reply_prefix" not in kwargs
+        assert kwargs["messages"][-1]["role"] == "user"
+
     # Anthropic Messages: tool_choice {"type": "any"} and {"type": "tool"}.
 
     ANTHROPIC_TOOLS = [

@@ -2417,11 +2417,14 @@ def _prepare_chat_prompt_for_request(
     tools: list | None = None,
     chat_template_kwargs: dict | None = None,
     is_partial: bool | None = None,
+    reply_prefix: str | None = None,
 ) -> tuple[int, tuple[str, list[int]] | None]:
+    # Only engines with ``supports_reply_prefix`` are given one.
+    prefix_kwargs = {"reply_prefix": reply_prefix} if reply_prefix else {}
     # Subclasses (e.g. distributed) have their own prompt handling.
     if type(engine) is BatchedEngine:
         prepared = engine.prepare_chat_prompt(
-            messages, tools, chat_template_kwargs, is_partial
+            messages, tools, chat_template_kwargs, is_partial, **prefix_kwargs
         )
         return len(prepared[1]), prepared
     return (
@@ -2430,6 +2433,7 @@ def _prepare_chat_prompt_for_request(
             tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
+            **prefix_kwargs,
         ),
         None,
     )
@@ -4993,7 +4997,12 @@ async def _resolve_forced_tool_call(
         return None
     if getattr(engine, "tokenizer", None) is None:
         await engine.start()
-    forced = resolve_forced_tool_call(choice, tools, engine.tokenizer)
+    forced = resolve_forced_tool_call(
+        choice,
+        tools,
+        engine.tokenizer,
+        reply_prefix=getattr(engine, "supports_reply_prefix", False),
+    )
     if forced is not None and is_partial:
         # The client continues its own partial assistant turn.
         logger.warning("tool_choice is not enforced on a partial assistant turn")
@@ -5012,13 +5021,19 @@ def _open_forced_tool_call(
     Returns the call, the messages and whether they end with a partial turn.
     Without reasoning, the reply starts with the call's opening as a partial
     assistant turn, appended here so that context-window validation,
-    preflight and the prepared prompt all see the real prompt.
+    preflight and the prepared prompt all see the real prompt. Formats with
+    a thought channel start the reply with ``forced.reply_prefix`` instead,
+    which the caller passes the same way.
     """
-    forced = replace(
-        forced,
-        thinks=_generation_prompt_opens_thinking(engine, chat_template_kwargs),
-    )
-    if forced.thinks:
+    if forced.thought is None:
+        thinks = _generation_prompt_opens_thinking(engine, chat_template_kwargs)
+    else:
+        # The model writes its own thought channel, unless the generation
+        # prompt holds an empty one (thinking off).
+        suffix, _ = engine._generation_prompt_text(chat_template_kwargs or None, False)
+        thinks = suffix is not None and not suffix.rstrip().endswith(forced.thought[1])
+    forced = replace(forced, thinks=thinks)
+    if thinks or forced.thought is not None:
         return forced, messages, False
     return forced, forced_call_messages(messages, forced), True
 
@@ -5239,10 +5254,12 @@ async def create_chat_completion(
             is_partial=is_partial,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        reply_prefix = None
         if forced_call is not None:
             forced_call, messages, is_partial = _open_forced_tool_call(
                 engine, messages, forced_call, merged_ct_kwargs
             )
+            reply_prefix = forced_call.reply_prefix
         # Validate context window before sending to model
         try:
             num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
@@ -5251,6 +5268,7 @@ async def create_chat_completion(
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 is_partial=is_partial,
+                reply_prefix=reply_prefix,
             )
         except Exception as e:
             if _is_chat_template_error(e):
@@ -5352,6 +5370,8 @@ async def create_chat_completion(
 
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        if reply_prefix:
+            chat_kwargs["reply_prefix"] = reply_prefix
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
         )
@@ -7885,6 +7905,7 @@ class _AnthropicPrompt:
     native_reasoning: bool
     thinking_budget: int | None
     model_settings: object | None
+    reply_prefix: str | None = None
 
 
 async def _prepare_anthropic_prompt(
@@ -8059,6 +8080,7 @@ def _count_anthropic_prompt(
             prompt.tools,
             chat_template_kwargs=prompt.chat_template_kwargs or None,
             is_partial=prompt.is_partial,
+            reply_prefix=prompt.reply_prefix,
         )
     except Exception as e:
         if _is_chat_template_error(e):
@@ -8193,14 +8215,19 @@ async def create_anthropic_message(
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
 
+        reply_prefix = None
         if forced_call is not None:
             forced_call, messages, is_partial = _open_forced_tool_call(
                 engine, messages, forced_call, merged_ct_kwargs
             )
+            reply_prefix = forced_call.reply_prefix
             prompt.messages = messages
             prompt.is_partial = is_partial
+            prompt.reply_prefix = reply_prefix
         # Forward partial-mode decision to the engine explicitly
         chat_kwargs["is_partial"] = is_partial
+        if reply_prefix:
+            chat_kwargs["reply_prefix"] = reply_prefix
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
@@ -8865,10 +8892,12 @@ async def create_response(
             is_partial=False,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        reply_prefix = None
         if forced_call is not None:
             forced_call, messages, is_partial = _open_forced_tool_call(
                 engine, messages, forced_call, merged_ct_kwargs
             )
+            reply_prefix = forced_call.reply_prefix
 
         # Validate context window
         try:
@@ -8878,6 +8907,7 @@ async def create_response(
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 is_partial=is_partial,
+                reply_prefix=reply_prefix,
             )
         except Exception as e:
             err_name = type(e).__name__.lower()
@@ -8965,6 +8995,8 @@ async def create_response(
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
         if is_partial is not None:
             chat_kwargs["is_partial"] = is_partial
+        if reply_prefix:
+            chat_kwargs["reply_prefix"] = reply_prefix
 
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms,
