@@ -1695,6 +1695,259 @@ class TestForcedToolChoice:
         assert kwargs["messages"][-1]["role"] == "user"
         assert engine.calls == []
 
+    # Anthropic Messages: tool_choice {"type": "any"} and {"type": "tool"}.
+
+    ANTHROPIC_TOOLS = [
+        {"name": t["function"]["name"], "input_schema": t["function"]["parameters"]}
+        for t in TOOLS
+    ]
+
+    def _anthropic_payload(self, tool_choice, **extra):
+        return {
+            "model": "test-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "Tell me about Vienna."}],
+            "tools": self.ANTHROPIC_TOOLS,
+            "tool_choice": tool_choice,
+            **extra,
+        }
+
+    @staticmethod
+    def _sse_events(response):
+        return [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+
+    def test_anthropic_any_reply_is_a_tool_use(self, client, engine):
+        engine.scripts.append(["=get_weather>", self.CALL, "</tool_call>"])
+
+        response = client.post(
+            "/v1/messages", json=self._anthropic_payload({"type": "any"})
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["stop_reason"] == "tool_use"
+        assert not any(b.get("text") for b in data["content"])
+        [call] = [b for b in data["content"] if b["type"] == "tool_use"]
+        assert call["name"] == "get_weather"
+        assert call["input"] == {"city": "Vienna"}
+        [sent] = engine.calls
+        assert sent["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function",
+        }
+        assert sent["is_partial"] is True
+
+    def test_anthropic_named_tool_streams_thinking_then_one_call(
+        self, client, engine, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "omlx.server._generation_prompt_opens_thinking", lambda *a: True
+        )
+        monkeypatch.setattr(
+            "omlx.server.prompt_opens_thinking", lambda *a, **k: (True, "<think>")
+        )
+        engine.scripts += [["Vienna is", " in Austria.\n"], [self.CALL]]
+        named = {"type": "tool", "name": "get_time"}
+
+        response = client.post(
+            "/v1/messages", json=self._anthropic_payload(named, stream=True)
+        )
+
+        assert response.status_code == 200
+        events = self._sse_events(response)
+        deltas = [e["delta"] for e in events if e["type"] == "content_block_delta"]
+        thinking = "".join(d.get("thinking", "") for d in deltas)
+        assert thinking == "Vienna is in Austria.\n"
+        assert not "".join(d.get("text", "") for d in deltas).strip()
+        blocks = [e["content_block"] for e in events if "content_block" in e]
+        assert [b["name"] for b in blocks if b["type"] == "tool_use"] == ["get_time"]
+        arguments = "".join(d.get("partial_json", "") for d in deltas)
+        assert json.loads(arguments) == {"city": "Vienna"}
+        [stop] = [e for e in events if e["type"] == "message_delta"]
+        assert stop["delta"]["stop_reason"] == "tool_use"
+        phase1, phase2 = engine.calls
+        assert phase1["stop"] == ["</think>"]
+        assert phase2["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function=get_time>",
+            "reasoning_content": "Vienna is in Austria.",
+        }
+        assert phase2["stop"] == ["</tool_call>"]
+
+    def test_anthropic_unknown_tool_is_rejected(self, client, engine):
+        named = {"type": "tool", "name": "get_tide"}
+
+        response = client.post("/v1/messages", json=self._anthropic_payload(named))
+
+        assert response.status_code == 400
+        assert engine.calls == []
+
+    def test_anthropic_auto_is_unchanged(self, client, engine):
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+
+        response = client.post(
+            "/v1/messages", json=self._anthropic_payload({"type": "auto"})
+        )
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"][-1]["role"] == "user"
+        assert kwargs["is_partial"] is False
+        assert "tool_choice" not in kwargs
+
+    def test_anthropic_engine_that_handles_tool_choice_gets_openais_form(
+        self, client, engine
+    ):
+        engine.handles_tool_choice = True
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+        named = {"type": "tool", "name": "get_time"}
+
+        response = client.post("/v1/messages", json=self._anthropic_payload(named))
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_time"},
+        }
+        assert kwargs["messages"][-1]["role"] == "user"
+        assert engine.calls == []
+
+    # Responses API: tool_choice "required" and {"type": "function", "name"}.
+
+    RESPONSES_TOOLS = [{"type": "function", **t["function"]} for t in TOOLS]
+
+    def _responses_payload(self, tool_choice, **extra):
+        return {
+            "model": "test-model",
+            "input": "Tell me about Vienna.",
+            "tools": self.RESPONSES_TOOLS,
+            "tool_choice": tool_choice,
+            **extra,
+        }
+
+    def test_responses_required_reply_is_a_function_call(self, client, engine):
+        engine.scripts.append(["=get_weather>", self.CALL, "</tool_call>"])
+
+        response = client.post(
+            "/v1/responses", json=self._responses_payload("required")
+        )
+
+        assert response.status_code == 200
+        output = response.json()["output"]
+        assert not any(
+            part.get("text") for item in output for part in item.get("content") or []
+        )
+        [call] = [item for item in output if item["type"] == "function_call"]
+        assert call["name"] == "get_weather"
+        assert json.loads(call["arguments"]) == {"city": "Vienna"}
+        [sent] = engine.calls
+        assert sent["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function",
+        }
+        assert sent["is_partial"] is True
+
+    def test_responses_named_function_streams_reasoning_then_one_call(
+        self, client, engine, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "omlx.server._generation_prompt_opens_thinking", lambda *a: True
+        )
+        monkeypatch.setattr(
+            "omlx.server.prompt_opens_thinking", lambda *a, **k: (True, "<think>")
+        )
+        engine.scripts += [["Vienna is", " in Austria.\n"], [self.CALL]]
+        named = {"type": "function", "name": "get_time"}
+
+        response = client.post(
+            "/v1/responses", json=self._responses_payload(named, stream=True)
+        )
+
+        assert response.status_code == 200
+        events = self._sse_events(response)
+        reasoning = "".join(
+            e["delta"]
+            for e in events
+            if e["type"] == "response.reasoning_summary_text.delta"
+        )
+        assert reasoning == "Vienna is in Austria.\n"
+        assert not "".join(
+            e["delta"] for e in events if e["type"] == "response.output_text.delta"
+        ).strip()
+        calls = [
+            e["item"]
+            for e in events
+            if e["type"] == "response.output_item.done"
+            and e["item"]["type"] == "function_call"
+        ]
+        assert [c["name"] for c in calls] == ["get_time"]
+        assert json.loads(calls[0]["arguments"]) == {"city": "Vienna"}
+        phase1, phase2 = engine.calls
+        assert phase1["stop"] == ["</think>"]
+        assert phase2["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function=get_time>",
+            "reasoning_content": "Vienna is in Austria.",
+        }
+        assert phase2["stop"] == ["</tool_call>"]
+
+    def test_responses_forced_call_takes_precedence_over_text_format(
+        self, client, engine
+    ):
+        engine.scripts.append(["=get_time>", self.CALL, "</tool_call>"])
+        text = {"format": {"type": "json_schema", "name": "x", "schema": {}}}
+
+        response = client.post(
+            "/v1/responses", json=self._responses_payload("required", text=text)
+        )
+
+        assert response.status_code == 200
+        assert "Warning" not in response.headers
+        [sent] = engine.calls
+        assert "compiled_grammar" not in sent
+        assert sent["messages"][0]["content"] == "Tell me about Vienna."
+
+    def test_responses_unknown_named_function_is_rejected(self, client, engine):
+        named = {"type": "function", "name": "get_tide"}
+
+        response = client.post("/v1/responses", json=self._responses_payload(named))
+
+        assert response.status_code == 400
+        assert engine.calls == []
+
+    def test_responses_auto_is_unchanged(self, client, engine):
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+
+        response = client.post("/v1/responses", json=self._responses_payload("auto"))
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["messages"][-1]["role"] == "user"
+        assert "is_partial" not in kwargs
+        assert "tool_choice" not in kwargs
+
+    def test_responses_engine_that_handles_tool_choice_gets_openais_form(
+        self, client, engine
+    ):
+        engine.handles_tool_choice = True
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+        named = {"type": "function", "name": "get_time"}
+
+        response = client.post("/v1/responses", json=self._responses_payload(named))
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_time"},
+        }
+        assert engine.calls == []
+
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""

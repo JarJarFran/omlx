@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Forced tool calls for OpenAI ``tool_choice`` (#2877).
 
-``"required"`` and a named function make the reply a call. The reply is
-started with the opening of a call in the model's own format, as its chat
-template renders an assistant turn with calls, and the model writes the rest.
-No grammar is needed, so this works without xgrammar and on every engine that
-renders oMLX's partial assistant turns.
+``"required"`` and a named function make the reply a call (Anthropic's
+``any`` and ``tool``, and the Responses API's choices, are mapped to these
+first). The reply is started with the opening of a call in the model's own
+format, as its chat template renders an assistant turn with calls, and the
+model writes the rest. No grammar is needed, so this works without xgrammar
+and on every engine that renders oMLX's partial assistant turns.
 """
 
 from __future__ import annotations
@@ -67,6 +68,43 @@ def _tool_names(tools: list[dict] | None) -> list[str]:
     return names
 
 
+def _field(choice: Any, key: str) -> Any:
+    if isinstance(choice, dict):
+        return choice.get(key)
+    return getattr(choice, key, None)
+
+
+def anthropic_tool_choice(choice: Any) -> Any:
+    """An Anthropic ``tool_choice`` that forces a call, in OpenAI's form.
+
+    ``{"type": "any"}`` is ``"required"``, and ``{"type": "tool", "name": n}``
+    names the function ``n``. None for ``auto``, ``none`` and anything else.
+    """
+    kind = _field(choice, "type")
+    if kind == "any":
+        return "required"
+    if kind == "tool":
+        return {"type": "function", "function": {"name": _field(choice, "name")}}
+    return None
+
+
+def responses_tool_choice(choice: Any) -> Any:
+    """A Responses API ``tool_choice`` that forces a call, in OpenAI's form.
+
+    ``"required"`` stays as it is, and ``{"type": "function", "name": n}``
+    names the function ``n`` (the Chat Completions form is accepted too).
+    None for ``auto``, ``none``, ``allowed_tools``, hosted tools and anything
+    else.
+    """
+    if choice == "required":
+        return choice
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        function = choice.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        return {"type": "function", "function": {"name": name or choice.get("name")}}
+    return None
+
+
 def _parser_format(tokenizer: Any) -> str | None:
     parser = getattr(tokenizer, "tool_parser", None)
     module = getattr(parser, "__module__", None) or ""
@@ -90,7 +128,7 @@ def resolve_forced_tool_call(
         name = function.get("name") if isinstance(function, dict) else None
         if not isinstance(name, str) or not name:
             raise InvalidRequestError(
-                "tool_choice: a named choice needs function.name",
+                "tool_choice: a named choice needs the function's name",
                 field="tool_choice",
             )
     else:

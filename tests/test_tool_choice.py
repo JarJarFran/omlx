@@ -7,11 +7,14 @@ from types import SimpleNamespace
 import pytest
 from mlx_lm.tool_parsers import gemma4, json_tools, qwen3_coder
 
+from omlx.api.anthropic_models import ToolChoice
 from omlx.api.tool_choice import (
     ForcedToolCall,
+    anthropic_tool_choice,
     forced_call_messages,
     forced_tool_call_outputs,
     resolve_forced_tool_call,
+    responses_tool_choice,
 )
 from omlx.engine.base import GenerationOutput
 from omlx.exceptions import InvalidRequestError
@@ -113,6 +116,48 @@ class TestResolveForcedToolCall:
         with pytest.raises(InvalidRequestError) as error:
             resolve_forced_tool_call(choice, tools, _tokenizer())
         assert error.value.field == field
+
+
+class TestOtherApiChoices:
+    """Anthropic's and the Responses API's choices, in OpenAI's form."""
+
+    @pytest.mark.parametrize(
+        ("choice", "expected"),
+        [
+            ({"type": "any"}, "required"),
+            (ToolChoice(type="any"), "required"),
+            ({"type": "tool", "name": "get_time"}, NAMED),
+            (ToolChoice(type="tool", name="get_time"), NAMED),
+            ({"type": "tool"}, {"type": "function", "function": {"name": None}}),
+            ({"type": "auto"}, None),
+            ({"type": "none"}, None),
+            (None, None),
+        ],
+    )
+    def test_anthropic(self, choice, expected):
+        assert anthropic_tool_choice(choice) == expected
+
+    @pytest.mark.parametrize(
+        ("choice", "expected"),
+        [
+            ("required", "required"),
+            ({"type": "function", "name": "get_time"}, NAMED),
+            (NAMED, NAMED),
+            ("auto", None),
+            ("none", None),
+            ({"type": "allowed_tools", "mode": "required", "tools": []}, None),
+            ({"type": "web_search_preview"}, None),
+            (None, None),
+        ],
+    )
+    def test_responses(self, choice, expected):
+        assert responses_tool_choice(choice) == expected
+
+    def test_anthropic_tool_without_a_name_is_a_request_error(self):
+        choice = anthropic_tool_choice({"type": "tool"})
+        with pytest.raises(InvalidRequestError) as error:
+            resolve_forced_tool_call(choice, TOOLS, _tokenizer())
+        assert error.value.field == "tool_choice"
 
 
 class TestForcedCallMessages:
