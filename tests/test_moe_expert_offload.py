@@ -43,6 +43,7 @@ if HAS_MLX:
         estimate_offload_admission_bytes,
         moe_offload_caches,
         moe_offload_stats,
+        releasable_moe_offload_bytes,
         release_moe_offload_slots,
         restore_moe_offload_slots,
     )
@@ -800,10 +801,12 @@ class TestSlotRelease:
             return freed, [c.capacity for c in caches]
 
         assert release(0) == (0, [24, 24])
+        assert releasable_moe_offload_bytes(caches) == 2 * 16 * b
         assert release(1) == (2 * 4 * b, [20, 20])  # 1/4 of the 16 above the floor
         assert len(reclaims) == 2  # once per cache that shrank
         assert release(2 * 4 * b + 1) == (2 * 8 * b, [12, 12])  # 3/4: 1/2 is short
         assert release(1) == (2 * 4 * b, [8, 8])  # 1/2 frees nothing more
+        assert releasable_moe_offload_bytes(caches) == 0
         assert release(10**12) == (0, [8, 8])
         restore_moe_offload_slots(caches, lambda: reclaims.append(1))
         assert [c.capacity for c in caches] == [24, 24]

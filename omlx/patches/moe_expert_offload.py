@@ -1419,6 +1419,15 @@ def release_moe_offload_slots(caches, need_bytes=None, reclaim=None) -> int:
     return released
 
 
+def releasable_moe_offload_bytes(caches) -> int:
+    """Bytes the caches can still give up above their floors."""
+    return sum(
+        (c.capacity - c.floor) * c.expert_bytes
+        for c in caches
+        if hasattr(c, "release_slots")
+    )
+
+
 def restore_moe_offload_slots(caches, reclaim=None) -> None:
     """Return every cache shrunk by :func:`release_moe_offload_slots` to full size.
 
@@ -1451,6 +1460,7 @@ __all__ = [
     "materialize_offload_state",
     "moe_offload_caches",
     "moe_offload_stats",
+    "releasable_moe_offload_bytes",
     "release_moe_offload_slots",
     "restore_moe_offload_slots",
 ]

@@ -2690,6 +2690,7 @@ class Scheduler:
         self.moe_offload_stats: Callable[[], dict] | None = None
         self.moe_offload_release: Callable[..., int] | None = None
         self.moe_offload_restore: Callable[..., None] | None = None
+        self.moe_offload_releasable: Callable[[], int] | None = None
         self._moe_offload_slots_released = False
 
         # Step counter for periodic cleanup
@@ -4959,6 +4960,29 @@ class Scheduler:
     # naturally exhausted, and a pass with nothing left to give costs one
     # ~100ms pause before the guard falls back to throttling as before.
     _MAX_PREFILL_EVICTION_RETRIES = 2
+    # A sized offload slot release gives up a quarter of the slots above the
+    # floor per pause (see release_moe_offload_slots), so reaching the floor
+    # takes up to four pauses where a release to the floor took one.
+    _MAX_OFFLOAD_SLOT_PAUSES = 4
+
+    def _offload_slot_pause(self, request_id: str, request: Any) -> bool:
+        """True when this pause's ladder will release MoE offload slots.
+
+        Such a pause does not count toward ``_MAX_PREFILL_EVICTION_RETRIES``:
+        the request reaches the floor with the same pauses left that a
+        single release to the floor would leave it, for the hot cache, idle
+        models and ANE banks. The release is skipped while another request
+        runs (``release_moe_offload_slots``), so then the pause counts."""
+        releasable = getattr(self, "moe_offload_releasable", None)
+        if releasable is None:
+            return False
+        if getattr(request, "prefill_offload_pauses", 0) >= getattr(
+            self, "_MAX_OFFLOAD_SLOT_PAUSES", Scheduler._MAX_OFFLOAD_SLOT_PAUSES
+        ):
+            return False
+        if any(rid != request_id for rid in getattr(self, "running", {})):
+            return False
+        return releasable() > 0
 
     def _raise_prefill_eviction_if_available(
         self,
@@ -4979,12 +5003,16 @@ class Scheduler:
             "_MAX_PREFILL_EVICTION_RETRIES",
             Scheduler._MAX_PREFILL_EVICTION_RETRIES,
         )
-        if request.prefill_eviction_retries >= max_retries:
-            return
         if target_cap <= 0 or predicted_transient <= 0:
             return
-
-        request.prefill_eviction_retries += 1
+        if Scheduler._offload_slot_pause(self, request_id, request):
+            request.prefill_offload_pauses = (
+                getattr(request, "prefill_offload_pauses", 0) + 1
+            )
+        elif request.prefill_eviction_retries >= max_retries:
+            return
+        else:
+            request.prefill_eviction_retries += 1
         config = getattr(self, "config", None)
         eviction_request = PrefillEvictionRequest(
             request_id=request_id,
